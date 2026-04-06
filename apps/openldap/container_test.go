@@ -7,11 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,15 +27,12 @@ import (
 var baseEnv = map[string]string{
 	"LDAP_SUFFIX":        "dc=test,dc=com",
 	"LDAP_ROOT_PASSWORD": "testpass",
-	"LDAP_ORGANISATION":  "Test",
 }
 
-func ldapsEnv() map[string]string {
-	env := make(map[string]string, len(baseEnv)+2)
-	maps.Copy(env, baseEnv)
-	env["LDAP_URLS"] = "ldaps://0.0.0.0:636/"
-	env["LDAPTLS_REQCERT"] = "never"
-	return env
+var customOrgEnv = map[string]string{
+	"LDAP_SUFFIX":            "dc=test,dc=com",
+	"LDAP_ROOT_PASSWORD":     "testpass",
+	"LDAP_ORGANIZATION_NAME": "Test Organization",
 }
 
 func runLDAP(t *testing.T, ctx context.Context, image string, env map[string]string, opts ...testcontainers.ContainerCustomizer) testcontainers.Container {
@@ -87,30 +87,64 @@ func Test(t *testing.T) {
 		require.Equal(t, 0, exitCode, "authenticated search should succeed")
 	})
 
-	t.Run("ldaps authenticated search", func(t *testing.T) {
+	t.Run("custom organization name", func(t *testing.T) {
+		c := runLDAP(t, ctx, image, customOrgEnv,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
+		)
+
+		exitCode, output, err := c.Exec(ctx, []string{
+			"ldapsearch", "-x", "-H", "ldap://localhost",
+			"-D", "cn=admin,dc=test,dc=com", "-w", "testpass",
+			"-b", "dc=test,dc=com", "(objectclass=organization)", "o",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "search for organization should succeed")
+		outputBytes, err := io.ReadAll(output)
+		require.NoError(t, err)
+		require.Contains(t, string(outputBytes), "Test Organization")
+	})
+
+	t.Run("overlays can be enabled", func(t *testing.T) {
+		env := make(map[string]string, len(baseEnv)+1)
+		maps.Copy(env, baseEnv)
+		env["LDAP_OVERLAYS"] = "memberof,refint"
+
+		c := runLDAP(t, ctx, image, env,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
+		)
+
+		exitCode, _, err := c.Exec(ctx, []string{
+			"ldapsearch", "-x", "-H", "ldap://localhost",
+			"-b", "", "-s", "base", "(objectclass=*)",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "server should start with overlays enabled")
+	})
+
+	t.Run("starttls authenticated search", func(t *testing.T) {
 		tlsDir := generateTestCerts(t)
 
-		c := runLDAP(t, ctx, image, ldapsEnv(),
-			testcontainers.WithExposedPorts("636/tcp"),
-			testcontainers.WithWaitStrategy(wait.ForListeningPort("636/tcp")),
+		c := runLDAP(t, ctx, image, baseEnv,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
 			withTLSFiles(tlsDir),
 		)
 
 		exitCode, _, err := c.Exec(ctx, []string{
-			"ldapsearch", "-x", "-H", "ldaps://localhost",
-			"-D", "cn=admin,dc=test,dc=com", "-w", "testpass",
-			"-b", "dc=test,dc=com", "(objectclass=*)",
+			"sh", "-c", "LDAPTLS_REQCERT=never ldapsearch -ZZ -x -H ldap://localhost -D cn=admin,dc=test,dc=com -w testpass -b dc=test,dc=com '(objectclass=*)'",
 		})
 		require.NoError(t, err)
-		require.Equal(t, 0, exitCode, "LDAPS authenticated search should succeed")
+		require.Equal(t, 0, exitCode, "StartTLS authenticated search should succeed")
 	})
 
-	t.Run("ldaps only rejects plain ldap", func(t *testing.T) {
+	t.Run("tls required rejects plain ldap on 389", func(t *testing.T) {
 		tlsDir := generateTestCerts(t)
 
-		c := runLDAP(t, ctx, image, ldapsEnv(),
-			testcontainers.WithExposedPorts("636/tcp"),
-			testcontainers.WithWaitStrategy(wait.ForListeningPort("636/tcp")),
+		c := runLDAP(t, ctx, image, baseEnv,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
 			withTLSFiles(tlsDir),
 		)
 
@@ -119,7 +153,150 @@ func Test(t *testing.T) {
 			"-b", "", "-s", "base", "(objectclass=*)",
 		})
 		require.NoError(t, err)
-		require.NotEqual(t, 0, exitCode, "plain LDAP should fail when only LDAPS is configured")
+		require.NotEqual(t, 0, exitCode, "plain LDAP should fail when TLS is required")
+	})
+
+	t.Run("ldaps remains available on 636", func(t *testing.T) {
+		tlsDir := generateTestCerts(t)
+
+		c := runLDAP(t, ctx, image, baseEnv,
+			testcontainers.WithExposedPorts("389/tcp", "636/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp"), wait.ForListeningPort("636/tcp")),
+			withTLSFiles(tlsDir),
+		)
+
+		exitCode, _, err := c.Exec(ctx, []string{
+			"sh", "-c", "LDAPTLS_REQCERT=never ldapsearch -x -H ldaps://localhost -D cn=admin,dc=test,dc=com -w testpass -b dc=test,dc=com '(objectclass=*)'",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "LDAPS on 636 should be available")
+	})
+
+	t.Run("passwords are hashed with ARGON2", func(t *testing.T) {
+		c := runLDAP(t, ctx, image, baseEnv,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
+		)
+
+		// Add a test user without a password
+		ldif := `dn: cn=testuser,dc=test,dc=com
+objectClass: inetOrgPerson
+cn: testuser
+sn: User`
+
+		exitCode, _, err := c.Exec(ctx, []string{
+			"sh", "-c", "echo '" + ldif + "' | ldapadd -x -H ldap://localhost -D cn=admin,dc=test,dc=com -w testpass",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "adding test user should succeed")
+
+		// Set password via ldappasswd which uses the server's password-hash setting
+		exitCode, _, err = c.Exec(ctx, []string{
+			"ldappasswd", "-x", "-H", "ldap://localhost",
+			"-D", "cn=admin,dc=test,dc=com", "-w", "testpass",
+			"-s", "newpassword", "cn=testuser,dc=test,dc=com",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "setting password via ldappasswd should succeed")
+
+		// Retrieve the user's password hash and verify it uses ARGON2
+		exitCode, output, err := c.Exec(ctx, []string{
+			"ldapsearch", "-x", "-H", "ldap://localhost",
+			"-D", "cn=admin,dc=test,dc=com", "-w", "testpass",
+			"-b", "cn=testuser,dc=test,dc=com", "userPassword",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "searching for user password should succeed")
+
+		outputBytes, err := io.ReadAll(output)
+		require.NoError(t, err)
+		outputStr := string(outputBytes)
+
+		// Extract base64-encoded userPassword (LDIF uses :: for base64 values)
+		// LDIF folds long lines with leading space on continuation lines
+		var b64Value strings.Builder
+		inPassword := false
+		for _, line := range strings.Split(outputStr, "\n") {
+			if strings.HasPrefix(line, "userPassword:: ") {
+				b64Value.WriteString(strings.TrimPrefix(line, "userPassword:: "))
+				inPassword = true
+			} else if inPassword && strings.HasPrefix(line, " ") {
+				b64Value.WriteString(strings.TrimPrefix(line, " "))
+			} else if inPassword {
+				break
+			}
+		}
+		decoded, err := base64.StdEncoding.DecodeString(b64Value.String())
+		require.NoError(t, err)
+		require.Contains(t, string(decoded), "{ARGON2}", "password should be hashed with ARGON2")
+	})
+
+	t.Run("admin password is hashed with ARGON2", func(t *testing.T) {
+		c := runLDAP(t, ctx, image, baseEnv,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
+		)
+
+		// Read the slapd.conf to check the rootpw hash
+		exitCode, output, err := c.Exec(ctx, []string{
+			"grep", "^rootpw", "/config/slapd.conf",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "grep rootpw should succeed")
+
+		outputBytes, err := io.ReadAll(output)
+		require.NoError(t, err)
+		require.Contains(t, string(outputBytes), "{ARGON2}", "admin password should be hashed with ARGON2")
+	})
+
+	t.Run("cleartext passwords in LDIF are hashed via ppolicy", func(t *testing.T) {
+		c := runLDAP(t, ctx, image, baseEnv,
+			testcontainers.WithExposedPorts("389/tcp"),
+			testcontainers.WithWaitStrategy(wait.ForListeningPort("389/tcp")),
+		)
+
+		// Add a user with a cleartext password
+		ldif := `dn: cn=testuser,dc=test,dc=com
+objectClass: inetOrgPerson
+cn: testuser
+sn: User
+userPassword: cleartextpassword`
+
+		exitCode, _, err := c.Exec(ctx, []string{
+			"sh", "-c", "echo '" + ldif + "' | ldapadd -x -H ldap://localhost -D cn=admin,dc=test,dc=com -w testpass",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "adding test user should succeed")
+
+		// Retrieve the user's password hash and verify it was hashed
+		exitCode, output, err := c.Exec(ctx, []string{
+			"ldapsearch", "-x", "-H", "ldap://localhost",
+			"-D", "cn=admin,dc=test,dc=com", "-w", "testpass",
+			"-b", "cn=testuser,dc=test,dc=com", "userPassword",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 0, exitCode, "searching for user password should succeed")
+
+		outputBytes, err := io.ReadAll(output)
+		require.NoError(t, err)
+		outputStr := string(outputBytes)
+
+		// Extract base64-encoded userPassword
+		var b64Value strings.Builder
+		inPassword := false
+		for _, line := range strings.Split(outputStr, "\n") {
+			if strings.HasPrefix(line, "userPassword:: ") {
+				b64Value.WriteString(strings.TrimPrefix(line, "userPassword:: "))
+				inPassword = true
+			} else if inPassword && strings.HasPrefix(line, " ") {
+				b64Value.WriteString(strings.TrimPrefix(line, " "))
+			} else if inPassword {
+				break
+			}
+		}
+		decoded, err := base64.StdEncoding.DecodeString(b64Value.String())
+		require.NoError(t, err)
+		require.Contains(t, string(decoded), "{ARGON2}", "cleartext password should be hashed with ARGON2 via ppolicy")
 	})
 }
 
